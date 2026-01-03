@@ -1,4 +1,4 @@
 # Replace with your actual domain (e.g., api.yourname.com)
-api.sla-ai.online{
+api.sla-ai.online {
     reverse_proxy api:8000
 }
