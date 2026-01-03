@@ -1,0 +1,24 @@
+services:
+  api:
+    build: .
+    restart: always
+    # We remove the host port mapping here because Caddy will talk to it internally
+    expose:
+      - "8000"
+
+  caddy:
+    image: caddy:2
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+
+volumes:
+  caddy_data:
+  caddy_config:
