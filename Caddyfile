@@ -1,5 +1,5 @@
 # Replace with your actual domain (e.g., api.yourname.com)
-https://emotion-speech-recognition.vercel.app {
+api.sla-ai.online{
     # Proxy requests to the 'api' service defined in docker-compose
     reverse_proxy api:8000
 
