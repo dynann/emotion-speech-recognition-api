@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI()
 
 # Configuration
-REPO_ID = "dynann/wav2vec2-emotion-speech-recognition-v2"
+REPO_ID = "dynann/wav2vec2-emotion-speech-recognition-v4"
 # Local fallback or cache path
 # MODEL_DIR = "./wav2vec2-emotion-speech-recognition"
 app.add_middleware(
