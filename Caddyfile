@@ -2,3 +2,7 @@
 api.sla-ai.online {
     reverse_proxy api:8000
 }
+
+personalize.sla-ai.online {
+    reverse_proxy pin-api:8000
+}
