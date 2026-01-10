@@ -1,3 +1,5 @@
 .venv
 __pycache__
 wav2vec2-emotion-speech-recognition
+multimodal-emotion-recognition
+wav2vec2-emotion-speech-recognition
