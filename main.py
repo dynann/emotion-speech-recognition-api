@@ -8,6 +8,8 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from transformers import (
     Wav2Vec2Model,
     Wav2Vec2Processor,
+    WhisperProcessor,
+    WhisperForConditionalGeneration,
     RobertaModel,
     AutoTokenizer,
     pipeline,
@@ -26,10 +28,15 @@ MAX_SAMPLES = int(SAMPLE_RATE * MAX_DURATION)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Globals
+# Globals for Emotion Model
 model = None
 processor = None
 id2label = {}
+
+# Globals for Transcription Model
+WHISPER_REPO_ID = "dynann/whisper-small-kh"
+whisper_model = None
+whisper_processor = None
 
 app.add_middleware(
     CORSMiddleware,
@@ -91,12 +98,11 @@ class SpeechEmotionModel(nn.Module):
 
 # --- LOADING LOGIC ---
 def load_model():
-    global model, processor, id2label
+    global model, processor, id2label, whisper_model, whisper_processor
 
     print(f"Loading speech emotion model resources from {REPO_ID}...")
 
     # 1. Load processor (audio only)
-    # This automatically downloads from the HF Hub
     processor = Wav2Vec2Processor.from_pretrained(REPO_ID)
 
     # 2. Download and load labels.json from Hub
@@ -118,6 +124,13 @@ def load_model():
 
     print(f"Speech model loaded successfully with {len(label2id)} emotions.")
 
+    # 4. Load Whisper model for transcription
+    print(f"Loading transcription model from {WHISPER_REPO_ID}...")
+    whisper_processor = WhisperProcessor.from_pretrained(WHISPER_REPO_ID)
+    whisper_model = WhisperForConditionalGeneration.from_pretrained(WHISPER_REPO_ID).to(device)
+    whisper_model.eval()
+    print("Transcription model loaded successfully.")
+
 
 # Load once at startup
 try:
@@ -131,95 +144,94 @@ except Exception as e:
 
 @app.get("/")
 def read_root():
-    return {"status": "ok", "message": "Emotion Recognition API is running"}
+    return {"status": "ok", "message": "Emotion Recognition and Transcription API is running"}
+
+
+async def process_audio_file(file: UploadFile):
+    file_content = await file.read()
+    if not file_content:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    
+    print(f"Received file: {file.filename}, size: {len(file_content)} bytes")
+
+    # Strategy 1: Try soundfile (fastest for WAV/FLAC)
+    try:
+        import soundfile as sf
+        audio, orig_sr = sf.read(io.BytesIO(file_content))
+        if len(audio.shape) > 1:
+            audio = np.mean(audio, axis=1)
+        if orig_sr != SAMPLE_RATE:
+            audio = librosa.resample(audio, orig_sr=orig_sr, target_sr=SAMPLE_RATE)
+        print("Successfully loaded audio via soundfile")
+        return audio
+    except Exception as sf_err:
+        # Strategy 2: Use ffmpeg via subprocess (handles WebM, MP3, etc.)
+        print(f"Soundfile failed: {sf_err}. Attempting ffmpeg...")
+        try:
+            import subprocess
+            import shutil
+
+            ffmpeg_path = shutil.which("ffmpeg") or "ffmpeg"
+            
+            # Call ffmpeg to convert input to raw 16k mono 32-bit float PCM
+            command = [
+                ffmpeg_path,
+                "-i", "pipe:0",  # Read from stdin
+                "-f", "f32le",   # Output format: float 32-bit little endian
+                "-acodec", "pcm_f32le",
+                "-ar", str(SAMPLE_RATE),  # 16000
+                "-ac", "1",      # Mono
+                "-y",            # Overwrite output
+                "pipe:1",        # Write to stdout
+            ]
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            stdout, stderr = process.communicate(input=file_content)
+
+            if process.returncode != 0:
+                error_msg = stderr.decode('utf-8', errors='ignore')
+                raise Exception(f"FFmpeg error: {error_msg}")
+
+            audio = np.frombuffer(stdout, dtype=np.float32)
+            if len(audio) == 0:
+                raise Exception("FFmpeg returned empty audio data")
+            print("Successfully loaded audio via ffmpeg")
+            return audio
+        except Exception as ffmpeg_err:
+            print(f"FFmpeg failed: {ffmpeg_err}. Falling back to librosa.load")
+            # Strategy 3: librosa.load fallback
+            try:
+                import tempfile
+                import os
+                with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{file.filename}") as tmp:
+                    tmp.write(file_content)
+                    tmp_path = tmp.name
+                
+                try:
+                    audio, _ = librosa.load(tmp_path, sr=SAMPLE_RATE, mono=True)
+                    print("Successfully loaded audio via librosa (temp file)")
+                    return audio
+                finally:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+            except Exception as librosa_err:
+                print(f"Librosa failed: {librosa_err}")
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"All audio loading strategies failed.\n1. Soundfile: {sf_err}\n2. FFmpeg: {ffmpeg_err}\n3. Librosa: {librosa_err}"
+                )
 
 
 @app.post("/generate-emotion")
 async def generate_emotion(file: UploadFile = File(...)):
     if model is None or processor is None:
-        raise HTTPException(status_code=500, detail="Model currently unavailable")
+        raise HTTPException(status_code=500, detail="Emotion model currently unavailable")
 
-    try:
-        file_content = await file.read()
-        if not file_content:
-            raise HTTPException(status_code=400, detail="Uploaded file is empty")
-        
-        print(f"Received file: {file.filename}, size: {len(file_content)} bytes")
-
-        # Strategy 1: Try soundfile (fastest for WAV/FLAC)
-        try:
-            import soundfile as sf
-            audio, orig_sr = sf.read(io.BytesIO(file_content))
-            if len(audio.shape) > 1:
-                audio = np.mean(audio, axis=1)
-            if orig_sr != SAMPLE_RATE:
-                audio = librosa.resample(audio, orig_sr=orig_sr, target_sr=SAMPLE_RATE)
-            print("Successfully loaded audio via soundfile")
-        except Exception as sf_err:
-            # Strategy 2: Use ffmpeg via subprocess (handles WebM, MP3, etc.)
-            print(f"Soundfile failed: {sf_err}. Attempting ffmpeg...")
-            try:
-                import subprocess
-                import shutil
-
-                ffmpeg_path = shutil.which("ffmpeg") or "ffmpeg"
-                
-                # Call ffmpeg to convert input to raw 16k mono 32-bit float PCM
-                command = [
-                    ffmpeg_path,
-                    "-i", "pipe:0",  # Read from stdin
-                    "-f", "f32le",   # Output format: float 32-bit little endian
-                    "-acodec", "pcm_f32le",
-                    "-ar", str(SAMPLE_RATE),  # 16000
-                    "-ac", "1",      # Mono
-                    "-y",            # Overwrite output
-                    "pipe:1",        # Write to stdout
-                ]
-                process = subprocess.Popen(
-                    command,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
-                stdout, stderr = process.communicate(input=file_content)
-
-                if process.returncode != 0:
-                    error_msg = stderr.decode('utf-8', errors='ignore')
-                    raise Exception(f"FFmpeg error: {error_msg}")
-
-                audio = np.frombuffer(stdout, dtype=np.float32)
-                if len(audio) == 0:
-                    raise Exception("FFmpeg returned empty audio data")
-                print("Successfully loaded audio via ffmpeg")
-            except Exception as ffmpeg_err:
-                print(f"FFmpeg failed: {ffmpeg_err}. Falling back to librosa.load")
-                # Strategy 3: librosa.load fallback
-                try:
-                    # Strategy 3: librosa.load with temporary file (more robust for some backends)
-                    import tempfile
-                    import os
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{file.filename}") as tmp:
-                        tmp.write(file_content)
-                        tmp_path = tmp.name
-                    
-                    try:
-                        audio, _ = librosa.load(tmp_path, sr=SAMPLE_RATE, mono=True)
-                        print("Successfully loaded audio via librosa (temp file)")
-                    finally:
-                        if os.path.exists(tmp_path):
-                            os.remove(tmp_path)
-                except Exception as librosa_err:
-                    print(f"Librosa failed: {librosa_err}")
-                    raise Exception(f"All audio loading strategies failed.\n"
-                                    f"1. Soundfile: {sf_err}\n"
-                                    f"2. FFmpeg: {ffmpeg_err}\n"
-                                    f"3. Librosa: {librosa_err}")
-
-    except Exception as e:
-        print(f"Audio processing error: {str(e)}")
-        raise HTTPException(
-            status_code=400, detail=f"Error processing audio file: {str(e)}"
-        )
+    audio = await process_audio_file(file)
 
     try:
         # ========================================
@@ -265,9 +277,40 @@ async def generate_emotion(file: UploadFile = File(...)):
 
         return {
             "emotion": top_emotion,
-            "transcription": "N/A (Speech-Only model)",
+            "transcription": "N/A (Use /transcribe for transcription)",
             "others": sorted_results,
         }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error during inference: {str(e)}")
+
+
+@app.post("/transcribe")
+async def transcribe(file: UploadFile = File(...)):
+    if whisper_model is None or whisper_processor is None:
+        raise HTTPException(status_code=500, detail="Transcription model currently unavailable")
+
+    audio = await process_audio_file(file)
+
+    try:
+        # Whisper expects 16000Hz, which is our SAMPLE_RATE
+        input_features = whisper_processor(
+            audio, 
+            sampling_rate=SAMPLE_RATE, 
+            return_tensors="pt"
+        ).input_features.to(device)
+
+        # Generate token ids
+        predicted_ids = whisper_model.generate(input_features)
+
+        # Decode token ids to text
+        transcription = whisper_processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
+
+        return {
+            "transcription": transcription,
+            "model": WHISPER_REPO_ID
+        }
+
+    except Exception as e:
+        print(f"Transcription error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error during transcription: {str(e)}")
